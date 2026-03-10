@@ -152,6 +152,34 @@ async def upload_file(friend_id: str, file: UploadFile, db: Session = Depends(ge
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+class ScrapeRequest(BaseModel):
+    friend_id: str
+    url: str
+
+@app.post("/api/scrape")
+async def scrape_url(req: ScrapeRequest, db: Session = Depends(get_db)):
+    """
+    Accepts a URL from Next.js, scrapes it, and passes it to the local RAG processor.
+    """
+    try:
+        chunks_added = rag.process_and_store_url(
+            url=req.url, 
+            friend_id=req.friend_id
+        )
+        
+        # Update friend config with the new data source
+        friend = db.query(models.Friend).filter(models.Friend.id == req.friend_id).first()
+        if friend:
+            ds = friend.dataSources[:] if friend.dataSources else []
+            if req.url not in ds:
+                ds.append(req.url)
+                friend.dataSources = ds
+                db.commit()
+                
+        return {"status": "success", "chunks_stored": chunks_added, "url": req.url}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 @app.get("/api/chat/{friend_id}")
 def get_chat_history(friend_id: str, db: Session = Depends(get_db)):
     messages = db.query(models.ChatMessage).filter(models.ChatMessage.friend_id == friend_id).order_by(models.ChatMessage.timestamp.asc()).all()

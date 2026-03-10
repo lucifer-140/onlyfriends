@@ -1,6 +1,6 @@
 import os
 import chromadb
-from langchain_community.document_loaders import PyPDFLoader
+from langchain_community.document_loaders import PyPDFLoader, WebBaseLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 # Initialize local ChromaDB client (stores data in a local folder)
@@ -37,6 +37,39 @@ def process_and_store_document(file_path: str, friend_id: str, original_filename
     documents = [chunk.page_content for chunk in chunks]
     ids = [f"{original_filename}_chunk_{i}" for i in range(len(chunks))]
     metadatas = [{"source": original_filename, "page": chunk.metadata.get("page", 0)} for chunk in chunks]
+    
+    collection.add(
+        documents=documents,
+        metadatas=metadatas,
+        ids=ids
+    )
+    
+    return len(chunks)
+
+def process_and_store_url(url: str, friend_id: str):
+    """
+    Scrapes a URL, splits it into semantic chunks, and stores it in the vector DB.
+    """
+    loader = WebBaseLoader(url)
+    pages = loader.load()
+    
+    text_splitter = RecursiveCharacterTextSplitter(
+        chunk_size=1000,
+        chunk_overlap=200,
+        length_function=len,
+    )
+    chunks = text_splitter.split_documents(pages)
+    
+    collection = chroma_client.get_or_create_collection(
+        name=f"friend_{friend_id}",
+        metadata={"hnsw:space": "cosine"}
+    )
+    
+    documents = [chunk.page_content for chunk in chunks]
+    # create safe ID
+    safe_url = "".join(c if c.isalnum() else "_" for c in url)[:50]
+    ids = [f"{safe_url}_chunk_{i}" for i in range(len(chunks))]
+    metadatas = [{"source": url, "page": 0} for chunk in chunks]
     
     collection.add(
         documents=documents,

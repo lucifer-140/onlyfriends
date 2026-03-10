@@ -18,6 +18,7 @@ import {
   Save,
   Play,
   Wand2,
+  ArrowUpRight
 } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { cn } from "@/lib/utils"
@@ -85,6 +86,8 @@ export function CreateView({ onFriendCreated }: CreateViewProps) {
   const [friendDescription, setFriendDescription] = useState("")
   const [instructions, setInstructions] = useState("")
   const [files, setFiles] = useState<File[]>([])
+  const [urls, setUrls] = useState<string[]>([])
+  const [urlInput, setUrlInput] = useState("")
   const [isSubmitting, setIsSubmitting] = useState(false)
 
   const onDrop = useCallback((acceptedFiles: File[]) => {
@@ -124,6 +127,15 @@ export function CreateView({ onFriendCreated }: CreateViewProps) {
         await fetch("http://localhost:8000/api/upload", {
           method: "POST",
           body: formData
+        })
+      }
+
+      // 3. Upload URLs (if any)
+      for (const url of urls) {
+        await fetch("http://localhost:8000/api/scrape", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ friend_id: friendId, url: url })
         })
       }
 
@@ -372,16 +384,45 @@ export function CreateView({ onFriendCreated }: CreateViewProps) {
               </p>
             </div>
 
-            {files.length > 0 && (
+            <div className="mt-6 flex gap-3">
+              <input
+                type="url"
+                value={urlInput}
+                onChange={(e) => setUrlInput(e.target.value)}
+                placeholder="https://example.com/docs"
+                className="flex-1 rounded-lg border border-border bg-input px-4 py-2 text-sm text-foreground placeholder:text-muted-foreground focus:border-primary focus:outline-none focus:ring-1 focus:ring-primary"
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" && urlInput) {
+                    setUrls(prev => [...prev, urlInput])
+                    setUrlInput("")
+                  }
+                }}
+              />
+              <Button
+                variant="outline"
+                className="gap-2 border-border"
+                onClick={() => {
+                  if (urlInput) {
+                    setUrls(prev => [...prev, urlInput])
+                    setUrlInput("")
+                  }
+                }}
+              >
+                <Plus className="h-4 w-4" />
+                Add URL
+              </Button>
+            </div>
+
+            {(files.length > 0 || urls.length > 0) && (
               <div className="rounded-lg bg-secondary p-4 mt-6">
                 <p className="text-sm text-muted-foreground">
-                  <span className="font-medium text-foreground">{files.length}</span>{" "}
-                  file{files.length > 1 ? "s" : ""} selected for ingestion
+                  <span className="font-medium text-foreground">{files.length + urls.length}</span>{" "}
+                  source{files.length + urls.length > 1 ? "s" : ""} selected for ingestion
                 </p>
                 <div className="mt-2 flex flex-col gap-2">
                   {files.map((file, idx) => (
                     <div
-                      key={idx}
+                      key={`file-${idx}`}
                       className="flex items-center justify-between rounded-md bg-card px-3 py-2 text-sm text-foreground border border-border"
                     >
                       <div className="flex items-center gap-2">
@@ -392,6 +433,26 @@ export function CreateView({ onFriendCreated }: CreateViewProps) {
                         onClick={(e) => {
                           e.stopPropagation();
                           setFiles(files.filter((_, i) => i !== idx))
+                        }}
+                        className="text-muted-foreground hover:text-foreground p-1"
+                      >
+                        <X className="h-4 w-4" />
+                      </button>
+                    </div>
+                  ))}
+                  {urls.map((url, idx) => (
+                    <div
+                      key={`url-${idx}`}
+                      className="flex items-center justify-between rounded-md bg-card px-3 py-2 text-sm text-foreground border border-border"
+                    >
+                      <div className="flex items-center gap-2">
+                        <ArrowUpRight className="h-4 w-4 text-muted-foreground" />
+                        <span className="truncate max-w-xs">{url}</span>
+                      </div>
+                      <button
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          setUrls(urls.filter((_, i) => i !== idx))
                         }}
                         className="text-muted-foreground hover:text-foreground p-1"
                       >
@@ -452,7 +513,7 @@ export function CreateView({ onFriendCreated }: CreateViewProps) {
                 <div className="rounded-lg bg-card p-4">
                   <p className="text-sm text-muted-foreground">Data Sources</p>
                   <p className="font-medium text-foreground">
-                    {files.length} file{files.length !== 1 ? "s" : ""}
+                    {files.length + urls.length} source{files.length + urls.length !== 1 ? "s" : ""}
                   </p>
                 </div>
                 <div className="rounded-lg bg-card p-4">
