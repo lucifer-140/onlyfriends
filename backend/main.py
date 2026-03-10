@@ -11,6 +11,7 @@ from sqlalchemy.orm import Session
 from fastapi import Depends
 import models
 from database import engine, get_db
+import worker
 
 models.Base.metadata.create_all(bind=engine)
 
@@ -129,14 +130,10 @@ async def upload_file(friend_id: str, file: UploadFile, db: Session = Depends(ge
         with open(temp_file_path, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
             
-        # Parse and store embeddings in local ChromaDB
-        chunks_added = rag.process_and_store_document(
-            file_path=temp_file_path, 
-            friend_id=friend_id, 
-            original_filename=file.filename
-        )
+        # Pass job to Celery background worker
+        worker.process_document_task.delay(temp_file_path, friend_id, file.filename)
         
-        # Update friend config with the new data source
+        # Update friend config with the new data source immediately mapping
         friend = db.query(models.Friend).filter(models.Friend.id == friend_id).first()
         if friend:
             ds = friend.dataSources[:] if friend.dataSources else []
@@ -144,12 +141,12 @@ async def upload_file(friend_id: str, file: UploadFile, db: Session = Depends(ge
                 ds.append(file.filename)
                 friend.dataSources = ds
                 db.commit()
-        
-        # Cleanup
-        os.remove(temp_file_path)
-        
-        return {"status": "success", "chunks_stored": chunks_added, "file": file.filename}
+                
+        return {"status": "queued", "file": file.filename, "message": "File processing has been queued in the background."}
     except Exception as e:
+        # If API submission fails, try to cleanup temp file immediately
+        if 'temp_file_path' in locals() and os.path.exists(temp_file_path):
+            os.remove(temp_file_path)
         raise HTTPException(status_code=500, detail=str(e))
 
 class ScrapeRequest(BaseModel):
@@ -162,12 +159,9 @@ async def scrape_url(req: ScrapeRequest, db: Session = Depends(get_db)):
     Accepts a URL from Next.js, scrapes it, and passes it to the local RAG processor.
     """
     try:
-        chunks_added = rag.process_and_store_url(
-            url=req.url, 
-            friend_id=req.friend_id
-        )
+        worker.process_url_task.delay(req.url, req.friend_id)
         
-        # Update friend config with the new data source
+        # Update friend config with the new data source immediately
         friend = db.query(models.Friend).filter(models.Friend.id == req.friend_id).first()
         if friend:
             ds = friend.dataSources[:] if friend.dataSources else []
@@ -176,7 +170,7 @@ async def scrape_url(req: ScrapeRequest, db: Session = Depends(get_db)):
                 friend.dataSources = ds
                 db.commit()
                 
-        return {"status": "success", "chunks_stored": chunks_added, "url": req.url}
+        return {"status": "queued", "url": req.url, "message": "URL scraping has been queued in the background."}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
