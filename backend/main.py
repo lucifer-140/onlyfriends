@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, UploadFile, File, Form
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import requests
@@ -11,7 +11,9 @@ from sqlalchemy.orm import Session
 from fastapi import Depends
 import models
 from database import engine, get_db
-import worker
+
+# Absolute path to the backend directory so background tasks can find temp files
+BACKEND_DIR = os.path.dirname(os.path.abspath(__file__))
 
 models.Base.metadata.create_all(bind=engine)
 
@@ -120,20 +122,31 @@ def get_friend(friend_id: str, db: Session = Depends(get_db)):
     }
 
 @app.post("/api/upload")
-async def upload_file(friend_id: str, file: UploadFile, db: Session = Depends(get_db)):
+async def upload_file(friend_id: str, file: UploadFile, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
     """
     Accepts a PDF document from Next.js and passes it to the local Langchain RAG processor.
+    Uses FastAPI BackgroundTasks for non-blocking processing (no Redis/Celery needed).
     """
     try:
-        # Save temp file
-        temp_file_path = f"./temp_{uuid.uuid4()}_{file.filename}"
+        # Save temp file with ABSOLUTE path so BackgroundTask can find it
+        temp_filename = f"temp_{uuid.uuid4()}_{file.filename}"
+        temp_file_path = os.path.join(BACKEND_DIR, temp_filename)
         with open(temp_file_path, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
-            
-        # Pass job to Celery background worker
-        worker.process_document_task.delay(temp_file_path, friend_id, file.filename)
+
+        def process_and_cleanup(path: str, fid: str, fname: str):
+            try:
+                chunks = rag.process_and_store_document(path, fid, fname)
+                print(f"[{fid}] ✓ Indexed {chunks} chunks from '{fname}'")
+            except Exception as e:
+                print(f"[{fid}] ✗ Error indexing '{fname}': {e}")
+            finally:
+                if os.path.exists(path):
+                    os.remove(path)
+
+        background_tasks.add_task(process_and_cleanup, temp_file_path, friend_id, file.filename)
         
-        # Update friend config with the new data source immediately mapping
+        # Update friend dataSources metadata immediately
         friend = db.query(models.Friend).filter(models.Friend.id == friend_id).first()
         if friend:
             ds = friend.dataSources[:] if friend.dataSources else []
@@ -142,9 +155,8 @@ async def upload_file(friend_id: str, file: UploadFile, db: Session = Depends(ge
                 friend.dataSources = ds
                 db.commit()
                 
-        return {"status": "queued", "file": file.filename, "message": "File processing has been queued in the background."}
+        return {"status": "queued", "file": file.filename, "message": "File processing started in the background."}
     except Exception as e:
-        # If API submission fails, try to cleanup temp file immediately
         if 'temp_file_path' in locals() and os.path.exists(temp_file_path):
             os.remove(temp_file_path)
         raise HTTPException(status_code=500, detail=str(e))
@@ -154,14 +166,21 @@ class ScrapeRequest(BaseModel):
     url: str
 
 @app.post("/api/scrape")
-async def scrape_url(req: ScrapeRequest, db: Session = Depends(get_db)):
+async def scrape_url(req: ScrapeRequest, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
     """
-    Accepts a URL from Next.js, scrapes it, and passes it to the local RAG processor.
+    Accepts a URL from Next.js, scrapes it, and stores embeddings via a background task.
     """
     try:
-        worker.process_url_task.delay(req.url, req.friend_id)
+        def scrape_and_store(url: str, fid: str):
+            try:
+                chunks = rag.process_and_store_url(url, fid)
+                print(f"[{fid}] ✓ Scraped and indexed {chunks} chunks from '{url}'")
+            except Exception as e:
+                print(f"[{fid}] ✗ Error scraping '{url}': {e}")
+
+        background_tasks.add_task(scrape_and_store, req.url, req.friend_id)
         
-        # Update friend config with the new data source immediately
+        # Update friend dataSources metadata immediately
         friend = db.query(models.Friend).filter(models.Friend.id == req.friend_id).first()
         if friend:
             ds = friend.dataSources[:] if friend.dataSources else []
@@ -170,7 +189,7 @@ async def scrape_url(req: ScrapeRequest, db: Session = Depends(get_db)):
                 friend.dataSources = ds
                 db.commit()
                 
-        return {"status": "queued", "url": req.url, "message": "URL scraping has been queued in the background."}
+        return {"status": "queued", "url": req.url, "message": "URL scraping started in the background."}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
