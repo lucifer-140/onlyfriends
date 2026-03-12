@@ -71,6 +71,54 @@ export function WorkspaceView({ initialFriendId }: WorkspaceViewProps) {
   const [messages, setMessages] = useState<any[]>([])
   const [inputValue, setInputValue] = useState("")
   const [isProcessing, setIsProcessing] = useState(false)
+  const [sessionStart] = useState(new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }))
+
+  const handleClear = async () => {
+    if (!selectedFriend || messages.length === 0) return
+    if (!confirm(`Clear all chat history with ${selectedFriend.name}? This cannot be undone.`)) return
+    try {
+      await fetch(`http://localhost:8000/api/chat/${selectedFriend.id}`, { method: "DELETE" })
+    } catch (e) {
+      console.error("Failed to clear chat on server", e)
+    }
+    setMessages([])
+  }
+
+  const handleExport = () => {
+    if (!selectedFriend || messages.length === 0) return
+    const stamp = new Date().toISOString().replace(/[:.]/g, "-")
+    const filename = `${selectedFriend.name.replace(/\s+/g, "_")}_chat_${stamp}.txt`
+    const lines = messages.map((m: any) => {
+      const speaker = m.role === "user" ? "You" : selectedFriend.name
+      return `[${m.timestamp}] ${speaker}:\n${m.content}\n\n`
+    })
+    const blob = new Blob(
+      [`Chat with ${selectedFriend.name}\nExported: ${new Date().toLocaleString()}\n${"-".repeat(60)}\n\n`, ...lines],
+      { type: "text/plain;charset=utf-8" }
+    )
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement("a")
+    a.href = url
+    a.download = filename
+    a.click()
+    URL.revokeObjectURL(url)
+  }
+
+  const handleCopyMessage = (text: string) => {
+    navigator.clipboard.writeText(text).catch(console.error)
+  }
+
+  const handleNewSession = async () => {
+    if (!selectedFriend) return
+    if (messages.length > 0 && !confirm("Start a new session? This will clear the current conversation.")) return
+    try {
+      await fetch(`http://localhost:8000/api/chat/${selectedFriend.id}`, { method: "DELETE" })
+    } catch (e) {
+      console.error("Failed to clear for new session", e)
+    }
+    setMessages([])
+    setInputValue("")
+  }
 
   // 1. Fetch available friends on mount
   useEffect(() => {
@@ -211,11 +259,23 @@ export function WorkspaceView({ initialFriendId }: WorkspaceViewProps) {
             )}
           </div>
           <div className="flex items-center gap-2">
-            <Button variant="outline" size="sm" className="gap-1 border-border">
+            <Button
+              variant="outline" size="sm"
+              className="gap-1 border-border disabled:opacity-40"
+              onClick={handleClear}
+              disabled={messages.length === 0 || isProcessing}
+              title="Clear conversation history"
+            >
               <RotateCcw className="h-4 w-4" />
               Clear
             </Button>
-            <Button variant="outline" size="sm" className="gap-1 border-border">
+            <Button
+              variant="outline" size="sm"
+              className="gap-1 border-border disabled:opacity-40"
+              onClick={handleExport}
+              disabled={messages.length === 0}
+              title="Export conversation as .txt"
+            >
               <Download className="h-4 w-4" />
               Export
             </Button>
@@ -284,7 +344,11 @@ export function WorkspaceView({ initialFriendId }: WorkspaceViewProps) {
                     {message.timestamp}
                   </span>
                   {message.role === "assistant" && (
-                    <button className="flex items-center gap-1 hover:text-foreground transition-colors">
+                    <button
+                      onClick={() => handleCopyMessage(message.content)}
+                      className="flex items-center gap-1 hover:text-foreground transition-colors"
+                      title="Copy to clipboard"
+                    >
                       <Copy className="h-3 w-3" />
                       Copy
                     </button>
@@ -362,7 +426,7 @@ export function WorkspaceView({ initialFriendId }: WorkspaceViewProps) {
             </div>
             <div className="flex items-center justify-between text-sm">
               <span className="text-muted-foreground">Started</span>
-              <span className="font-medium text-foreground">10:30 AM</span>
+              <span className="font-medium text-foreground">{sessionStart}</span>
             </div>
             <div className="flex items-center justify-between text-sm">
               <span className="text-muted-foreground">Status</span>
@@ -411,15 +475,32 @@ export function WorkspaceView({ initialFriendId }: WorkspaceViewProps) {
         <div className="rounded-xl border border-border bg-card p-5">
           <h3 className="font-semibold text-foreground">Quick Actions</h3>
           <div className="mt-4 space-y-2">
-            <Button variant="outline" size="sm" className="w-full justify-start gap-2 border-border">
+            <Button
+              variant="outline" size="sm"
+              className="w-full justify-start gap-2 border-border disabled:opacity-40"
+              onClick={() => {
+                const last = messages.filter((m: any) => m.role === "assistant").at(-1)
+                if (last) handleCopyMessage(last.content)
+              }}
+              disabled={!messages.some((m: any) => m.role === "assistant")}
+            >
               <Copy className="h-4 w-4" />
               Copy Full Response
             </Button>
-            <Button variant="outline" size="sm" className="w-full justify-start gap-2 border-border">
+            <Button
+              variant="outline" size="sm"
+              className="w-full justify-start gap-2 border-border disabled:opacity-40"
+              onClick={handleExport}
+              disabled={messages.length === 0}
+            >
               <Download className="h-4 w-4" />
-              Export as PDF
+              Export as .txt
             </Button>
-            <Button variant="outline" size="sm" className="w-full justify-start gap-2 border-border">
+            <Button
+              variant="outline" size="sm"
+              className="w-full justify-start gap-2 border-border"
+              onClick={handleNewSession}
+            >
               <RotateCcw className="h-4 w-4" />
               Start New Session
             </Button>

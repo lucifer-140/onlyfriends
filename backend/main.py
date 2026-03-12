@@ -179,6 +179,13 @@ def get_chat_history(friend_id: str, db: Session = Depends(get_db)):
     messages = db.query(models.ChatMessage).filter(models.ChatMessage.friend_id == friend_id).order_by(models.ChatMessage.timestamp.asc()).all()
     return [{"role": m.role, "text": m.text} for m in messages]
 
+@app.delete("/api/chat/{friend_id}")
+def clear_chat_history(friend_id: str, db: Session = Depends(get_db)):
+    """Deletes all chat messages for a given friend (used by the Clear button in the UI)."""
+    deleted = db.query(models.ChatMessage).filter(models.ChatMessage.friend_id == friend_id).delete()
+    db.commit()
+    return {"status": "cleared", "deleted_count": deleted}
+
 @app.post("/api/chat")
 async def generate_chat(request: ChatRequest, db: Session = Depends(get_db)):
     """
@@ -193,22 +200,34 @@ async def generate_chat(request: ChatRequest, db: Session = Depends(get_db)):
 
     # 2. Build the final prompt for Llama 3 with strict quality guardrails
     has_context = "No internal" not in mock_internal_knowledge
+
+    # Fix #1: Strip [INTERNAL KNOWLEDGE CHUNK] labels so they never appear in output.
+    # The model was echoing these tags verbatim — we clean them before injecting.
+    clean_context = mock_internal_knowledge.replace("[INTERNAL KNOWLEDGE CHUNK]: ", "").strip()
+
     context_block = f"""
---- INTERNAL COMPANY DOCUMENTS ---
-{mock_internal_knowledge}
---- END OF DOCUMENTS ---
+BACKGROUND REFERENCE (internal company documents — use ONLY if the user explicitly asks about them):
+---
+{clean_context}
+---
 """ if has_context else ""
+
+    import datetime
+    today_str = datetime.date.today().strftime("%d %B %Y")  # e.g. "12 March 2026"
 
     final_prompt = f"""{request.system_prompt}
 
-STRICT OUTPUT RULES (follow these exactly):
-1. ONLY use facts that appear in the documents provided or facts explicitly stated by the user. Do NOT invent dates, names, metrics, features, or plans that are not present.
-2. Do NOT use placeholder brackets like [Start Date], [Your Name], [Insert Here], etc. If a required value is missing, ask the user for it in a short clarifying question instead of guessing.
-3. If the user specifies a word limit (e.g. "under 150 words", "in 3 sentences"), count carefully and stay within that limit. Do NOT exceed it.
-4. Do NOT add generic filler phrases like "We're excited to announce", "This is a testament to", "Thank you for your hard work and dedication", or "game-changer" unless the user explicitly asks for them.
-5. If asked to follow a specific template or format, output ONLY that format. Do not add preamble, commentary, or closing remarks outside the template.
-6. Maintain consistent tone and sentiment throughout. If the user says "high performer", do not describe them with weakness language. If the user says "formal", stay formal throughout.
-7. If you are unsure of any required detail, say so explicitly. Do not guess or hallucinate.
+Today's date is {today_str}.
+
+STRICT OUTPUT RULES — follow every rule exactly, no exceptions:
+1. ONLY use facts that appear in the user's request or the background documents. Do NOT invent dates, names, metrics, features, or roadmap items that are not present in the input.
+2. ABSOLUTELY NO bracket placeholders of any kind. This includes [Your Name], [Insert Date], [Today, X], [name needed], [text], (Note: ...) or any similar pattern. If a value is missing, write the actual value or ask the user one short clarifying question. TODAY'S DATE is already provided above — use it directly, never wrap it in brackets.
+3. If the user specifies a word or sentence limit (e.g. "under 80 words", "exactly 3 sentences"), count carefully. Output ONLY within that limit. Do NOT add preamble like "Here is a summary in 3 sentences:" — just output the content.
+4. Do NOT use corporate filler phrases: "We're excited to announce", "game-changer", "This is a testament to", "Thank you for your hard work", "I'm pleased to inform", or similar hype language — unless the user explicitly requests it.
+5. If the user gives you a specific format or template, output ONLY that format. No preamble, no "Here is the response:", no closing commentary, no (Note: ...) annotations at the end.
+6. Maintain consistent tone throughout. If the prompt says "high performer", every sentence must reflect a positive evaluation — never soften to "mixed" or add weaknesses. If the prompt says "critical review", be critical throughout.
+7. Do NOT add [Meta: ...] annotations, tone labels, or audience notes to the output. These are internal instructions, not output content.
+8. The background documents are reference material only. Do NOT inject facts from those documents (names, dates, metrics, project details) into a response unless the user's request is explicitly about those documents. If the user gives you all the facts they need in the prompt itself, use only those facts.
 {context_block}
 USER REQUEST:
 {request.prompt}
