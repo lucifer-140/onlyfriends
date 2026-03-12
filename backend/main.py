@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, UploadFile, File, Form, BackgroundTasks
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import requests
@@ -11,9 +11,7 @@ from sqlalchemy.orm import Session
 from fastapi import Depends
 import models
 from database import engine, get_db
-
-# Absolute path to the backend directory so background tasks can find temp files
-BACKEND_DIR = os.path.dirname(os.path.abspath(__file__))
+import worker
 
 models.Base.metadata.create_all(bind=engine)
 
@@ -122,31 +120,20 @@ def get_friend(friend_id: str, db: Session = Depends(get_db)):
     }
 
 @app.post("/api/upload")
-async def upload_file(friend_id: str, file: UploadFile, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
+async def upload_file(friend_id: str = Form(...), file: UploadFile = File(...), db: Session = Depends(get_db)):
     """
     Accepts a PDF document from Next.js and passes it to the local Langchain RAG processor.
-    Uses FastAPI BackgroundTasks for non-blocking processing (no Redis/Celery needed).
     """
     try:
-        # Save temp file with ABSOLUTE path so BackgroundTask can find it
-        temp_filename = f"temp_{uuid.uuid4()}_{file.filename}"
-        temp_file_path = os.path.join(BACKEND_DIR, temp_filename)
+        # Save temp file
+        temp_file_path = f"./temp_{uuid.uuid4()}_{file.filename}"
         with open(temp_file_path, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
-
-        def process_and_cleanup(path: str, fid: str, fname: str):
-            try:
-                chunks = rag.process_and_store_document(path, fid, fname)
-                print(f"[{fid}] ✓ Indexed {chunks} chunks from '{fname}'")
-            except Exception as e:
-                print(f"[{fid}] ✗ Error indexing '{fname}': {e}")
-            finally:
-                if os.path.exists(path):
-                    os.remove(path)
-
-        background_tasks.add_task(process_and_cleanup, temp_file_path, friend_id, file.filename)
+            
+        # Pass job to Celery background worker
+        worker.process_document_task.delay(temp_file_path, friend_id, file.filename)
         
-        # Update friend dataSources metadata immediately
+        # Update friend config with the new data source immediately mapping
         friend = db.query(models.Friend).filter(models.Friend.id == friend_id).first()
         if friend:
             ds = friend.dataSources[:] if friend.dataSources else []
@@ -155,8 +142,9 @@ async def upload_file(friend_id: str, file: UploadFile, background_tasks: Backgr
                 friend.dataSources = ds
                 db.commit()
                 
-        return {"status": "queued", "file": file.filename, "message": "File processing started in the background."}
+        return {"status": "queued", "file": file.filename, "message": "File processing has been queued in the background."}
     except Exception as e:
+        # If API submission fails, try to cleanup temp file immediately
         if 'temp_file_path' in locals() and os.path.exists(temp_file_path):
             os.remove(temp_file_path)
         raise HTTPException(status_code=500, detail=str(e))
@@ -166,21 +154,14 @@ class ScrapeRequest(BaseModel):
     url: str
 
 @app.post("/api/scrape")
-async def scrape_url(req: ScrapeRequest, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
+async def scrape_url(req: ScrapeRequest, db: Session = Depends(get_db)):
     """
-    Accepts a URL from Next.js, scrapes it, and stores embeddings via a background task.
+    Accepts a URL from Next.js, scrapes it, and passes it to the local RAG processor.
     """
     try:
-        def scrape_and_store(url: str, fid: str):
-            try:
-                chunks = rag.process_and_store_url(url, fid)
-                print(f"[{fid}] ✓ Scraped and indexed {chunks} chunks from '{url}'")
-            except Exception as e:
-                print(f"[{fid}] ✗ Error scraping '{url}': {e}")
-
-        background_tasks.add_task(scrape_and_store, req.url, req.friend_id)
+        worker.process_url_task.delay(req.url, req.friend_id)
         
-        # Update friend dataSources metadata immediately
+        # Update friend config with the new data source immediately
         friend = db.query(models.Friend).filter(models.Friend.id == req.friend_id).first()
         if friend:
             ds = friend.dataSources[:] if friend.dataSources else []
@@ -189,7 +170,7 @@ async def scrape_url(req: ScrapeRequest, background_tasks: BackgroundTasks, db: 
                 friend.dataSources = ds
                 db.commit()
                 
-        return {"status": "queued", "url": req.url, "message": "URL scraping started in the background."}
+        return {"status": "queued", "url": req.url, "message": "URL scraping has been queued in the background."}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -210,22 +191,42 @@ async def generate_chat(request: ChatRequest, db: Session = Depends(get_db)):
         n_results=4
     )
 
-    # 2. Build the final prompt for Llama 3
-    final_prompt = f"""
-    System Instructions: {request.system_prompt}
-    
-    Internal Company Data:
-    {mock_internal_knowledge}
-    
-    User Request: {request.prompt}
-    """
+    # 2. Build the final prompt for Llama 3 with strict quality guardrails
+    has_context = "No internal" not in mock_internal_knowledge
+    context_block = f"""
+--- INTERNAL COMPANY DOCUMENTS ---
+{mock_internal_knowledge}
+--- END OF DOCUMENTS ---
+""" if has_context else ""
+
+    final_prompt = f"""{request.system_prompt}
+
+STRICT OUTPUT RULES (follow these exactly):
+1. ONLY use facts that appear in the documents provided or facts explicitly stated by the user. Do NOT invent dates, names, metrics, features, or plans that are not present.
+2. Do NOT use placeholder brackets like [Start Date], [Your Name], [Insert Here], etc. If a required value is missing, ask the user for it in a short clarifying question instead of guessing.
+3. If the user specifies a word limit (e.g. "under 150 words", "in 3 sentences"), count carefully and stay within that limit. Do NOT exceed it.
+4. Do NOT add generic filler phrases like "We're excited to announce", "This is a testament to", "Thank you for your hard work and dedication", or "game-changer" unless the user explicitly asks for them.
+5. If asked to follow a specific template or format, output ONLY that format. Do not add preamble, commentary, or closing remarks outside the template.
+6. Maintain consistent tone and sentiment throughout. If the user says "high performer", do not describe them with weakness language. If the user says "formal", stay formal throughout.
+7. If you are unsure of any required detail, say so explicitly. Do not guess or hallucinate.
+{context_block}
+USER REQUEST:
+{request.prompt}
+
+RESPONSE:"""
 
     try:
         # 3. Call local Ollama runtime
         response = requests.post(OLLAMA_API_URL, json={
             "model": "llama3",
             "prompt": final_prompt,
-            "stream": False
+            "stream": False,
+            "options": {
+                "temperature": 0.1,      # Low = more consistent/deterministic outputs
+                "top_p": 0.9,            # Prevents wildly different word choices
+                "num_predict": 2048,     # Max tokens (~1500 words) - prevents runaway outputs
+                "repeat_penalty": 1.1    # Discourages repeated generic filler phrases
+            }
         })
         response.raise_for_status()
         

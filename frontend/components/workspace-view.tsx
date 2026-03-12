@@ -4,6 +4,7 @@ import { useState, useEffect } from "react"
 import ReactMarkdown from "react-markdown"
 import {
   FileText,
+  Globe,
   Send,
   Paperclip,
   Bot,
@@ -376,18 +377,35 @@ export function WorkspaceView({ initialFriendId }: WorkspaceViewProps) {
         <div className="rounded-xl border border-border bg-card p-5">
           <h3 className="font-semibold text-foreground">Attached Files</h3>
           <div className="mt-4 space-y-2">
-            <div className="flex items-center gap-3 rounded-lg bg-secondary p-3">
-              <FileText className="h-5 w-5 text-primary" />
-              <div className="flex-1 min-w-0">
-                <p className="text-sm font-medium text-foreground truncate">Q4_Vendor_Contract.pdf</p>
-                <p className="text-xs text-muted-foreground">2.4 MB</p>
-              </div>
-            </div>
+            {(!selectedFriend || !selectedFriend.dataSources || selectedFriend.dataSources.length === 0) ? (
+              <p className="text-xs text-muted-foreground italic">
+                No data sources attached yet. Upload files or add URLs when creating or editing this Digital Friend.
+              </p>
+            ) : (
+              selectedFriend.dataSources.map((source: string, i: number) => {
+                const isUrl = source.startsWith("http://") || source.startsWith("https://")
+                const label = isUrl
+                  ? (() => { try { return new URL(source).hostname } catch { return source } })()
+                  : source
+                return (
+                  <div key={i} className="flex items-center gap-3 rounded-lg bg-secondary p-3">
+                    {isUrl
+                      ? <Globe className="h-5 w-5 shrink-0 text-primary" />
+                      : <FileText className="h-5 w-5 shrink-0 text-primary" />
+                    }
+                    <div className="flex-1 min-w-0">
+                      <p className="text-sm font-medium text-foreground truncate" title={source}>
+                        {label}
+                      </p>
+                      <p className="text-xs text-muted-foreground">
+                        {isUrl ? "Web source" : "Document"}
+                      </p>
+                    </div>
+                  </div>
+                )
+              })
+            )}
           </div>
-          <Button variant="outline" size="sm" className="mt-3 w-full gap-1.5 border-border">
-            <Paperclip className="h-4 w-4" />
-            Add More Files
-          </Button>
         </div>
 
         <div className="rounded-xl border border-border bg-card p-5">
