@@ -2,9 +2,13 @@ from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import requests
+import requests.exceptions
 import os
 import shutil
 import uuid
+import re
+import datetime
+import logging
 import rag
 import json
 from sqlalchemy.orm import Session
@@ -12,6 +16,9 @@ from fastapi import Depends
 import models
 from database import engine, get_db
 import worker
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 models.Base.metadata.create_all(bind=engine)
 
@@ -27,12 +34,77 @@ app.add_middleware(
 )
 
 OLLAMA_API_URL = "http://localhost:11434/api/generate"
+OLLAMA_TIMEOUT_SECONDS = 120  # P0: Prevent UI hangs from long generations
+
+# ── P0: Prompt injection patterns ────────────────────────────────────────────
+INJECTION_PATTERNS = [
+    r"ignore (all|previous|above) (instructions?|rules?|prompts?)",
+    r"disregard (the|your|all) (above|previous|system)",
+    r"you are now",
+    r"new instruction(s)?:",
+    r"system( )?prompt:",
+    r"forget everything",
+    r"override (the|all) (rules?|instructions?)",
+]
+
+def sanitize_user_input(text: str) -> str:
+    """Guard against prompt injection attacks."""
+    for pattern in INJECTION_PATTERNS:
+        if re.search(pattern, text, re.IGNORECASE):
+            raise HTTPException(
+                status_code=400,
+                detail="Your message contains restricted phrases. Please rephrase your request."
+            )
+    return text
+
+# ── P0: Post-process response cleaner ────────────────────────────────────────
+def clean_ai_response(text: str) -> str:
+    """Strip preamble lines and trailing annotation notes from model output."""
+    # Remove preamble openings
+    preamble_patterns = [
+        r"^here is (the|a|my) (response|summary|rewrite|answer|email|memo|review|table|output|text)[:\.]?\s*\n?",
+        r"^here are (three|3|the|some|your) (draft |options? |subject |lines?|bullets?|items?|points?)[:\.]?\s*\n?",
+        r"^based on (the|your) (provided |above |given )?",
+        r"^sure[,!]?\s*(here is|here are|I'll|let me)?[:\.]?\s*\n?",
+        r"^(I've|I have) (prepared|written|drafted|created|crafted)[^.]*\.\s*\n?",
+    ]
+    for pattern in preamble_patterns:
+        text = re.sub(pattern, "", text, flags=re.IGNORECASE)
+
+    # Remove trailing (Note: ...) and similar annotation blocks
+    text = re.sub(r"\n?\(Note:.*?\)\s*$", "", text, flags=re.IGNORECASE | re.DOTALL)
+    text = re.sub(r"\n?Note:.*?$", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\n?\[Meta:.*?\]\s*$", "", text, flags=re.IGNORECASE | re.DOTALL)
+    text = re.sub(r"\n?\(I've? (followed|stayed|used|kept).*?\)\s*$", "", text, flags=re.IGNORECASE | re.DOTALL)
+
+    return text.strip()
+
+# ── Self-contained prompt detector ───────────────────────────────────────────
+SELF_CONTAINED_SIGNALS = [
+    "from this", "only what's written", "only what is written",
+    "factual only", "don't add new info", "do not add new info",
+    "don't add information", "from this memo", "from this newsletter",
+    "from this text", "from this email", "extract from", "only use",
+    "only the above", "listed above", "3 bullet points only",
+    "summarize this", "list action items from", "use only this text",
+]
+
+def is_prompt_self_contained(prompt: str) -> bool:
+    """Returns True when the user provides all needed facts inline."""
+    prompt_lower = prompt.lower()
+    if any(sig in prompt_lower for sig in SELF_CONTAINED_SIGNALS):
+        return True
+    # Also suppress if prompt has inline structured data AND is short
+    has_inline_data = bool(re.search(r"(\d+%|\d+\.\d+|>\s*\d|•|-\s+\w)", prompt))
+    if has_inline_data and len(prompt) < 800:
+        return True
+    return False
+
 
 class ChatRequest(BaseModel):
     friend_id: str
     prompt: str
     system_prompt: str = ""
-    # In a full flow, this would be actual file UUIDs parsed from the DB
     context_files: list[str] = []
 
 @app.get("/health")
@@ -46,7 +118,7 @@ class FriendConfig(BaseModel):
     description: str
     system_prompt: str
     creator: str = "system"
-    
+
 @app.post("/api/friends")
 def create_friend(config: FriendConfig, db: Session = Depends(get_db)):
     db_friend = models.Friend(
@@ -58,7 +130,6 @@ def create_friend(config: FriendConfig, db: Session = Depends(get_db)):
         dataSources=[],
         creator=config.creator
     )
-    # If friend exists, update it. Else insert.
     existing = db.query(models.Friend).filter(models.Friend.id == config.id).first()
     if existing:
         existing.name = config.name
@@ -74,16 +145,11 @@ def create_friend(config: FriendConfig, db: Session = Depends(get_db)):
 @app.get("/api/friends")
 def get_all_friends(db: Session = Depends(get_db)):
     friends = db.query(models.Friend).all()
-    # Serialize for frontend
     return [
         {
-            "id": f.id,
-            "name": f.name,
-            "department": f.department,
-            "description": f.description,
-            "system_prompt": f.system_prompt,
-            "dataSources": f.dataSources,
-            "creator": f.creator
+            "id": f.id, "name": f.name, "department": f.department,
+            "description": f.description, "system_prompt": f.system_prompt,
+            "dataSources": f.dataSources, "creator": f.creator
         }
         for f in friends
     ]
@@ -93,13 +159,9 @@ def get_my_friends(creator_id: str, db: Session = Depends(get_db)):
     friends = db.query(models.Friend).filter(models.Friend.creator == creator_id).all()
     return [
         {
-            "id": f.id,
-            "name": f.name,
-            "department": f.department,
-            "description": f.description,
-            "system_prompt": f.system_prompt,
-            "dataSources": f.dataSources,
-            "creator": f.creator
+            "id": f.id, "name": f.name, "department": f.department,
+            "description": f.description, "system_prompt": f.system_prompt,
+            "dataSources": f.dataSources, "creator": f.creator
         }
         for f in friends
     ]
@@ -110,30 +172,28 @@ def get_friend(friend_id: str, db: Session = Depends(get_db)):
     if not friend:
         raise HTTPException(status_code=404, detail="Friend not found")
     return {
-        "id": friend.id,
-        "name": friend.name,
-        "department": friend.department,
-        "description": friend.description,
-        "system_prompt": friend.system_prompt,
-        "dataSources": friend.dataSources,
-        "creator": friend.creator
+        "id": friend.id, "name": friend.name, "department": friend.department,
+        "description": friend.description, "system_prompt": friend.system_prompt,
+        "dataSources": friend.dataSources, "creator": friend.creator
     }
 
 @app.post("/api/upload")
 async def upload_file(friend_id: str = Form(...), file: UploadFile = File(...), db: Session = Depends(get_db)):
-    """
-    Accepts a PDF document from Next.js and passes it to the local Langchain RAG processor.
-    """
+    """Accepts a PDF document from Next.js and passes it to the local Langchain RAG processor."""
+    temp_file_path = None
     try:
-        # Save temp file
         temp_file_path = f"./temp_{uuid.uuid4()}_{file.filename}"
         with open(temp_file_path, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
-            
-        # Pass job to Celery background worker
+
+        # P2: File size guard — reject PDFs over 50MB
+        file_size_mb = os.path.getsize(temp_file_path) / (1024 * 1024)
+        if file_size_mb > 50:
+            os.remove(temp_file_path)
+            raise HTTPException(status_code=413, detail=f"File exceeds 50MB limit ({file_size_mb:.1f}MB). Please split the PDF.")
+
         worker.process_document_task.delay(temp_file_path, friend_id, file.filename)
-        
-        # Update friend config with the new data source immediately mapping
+
         friend = db.query(models.Friend).filter(models.Friend.id == friend_id).first()
         if friend:
             ds = friend.dataSources[:] if friend.dataSources else []
@@ -141,11 +201,13 @@ async def upload_file(friend_id: str = Form(...), file: UploadFile = File(...), 
                 ds.append(file.filename)
                 friend.dataSources = ds
                 db.commit()
-                
+
+        logger.info(f"[UPLOAD] Queued '{file.filename}' for friend '{friend_id}'")
         return {"status": "queued", "file": file.filename, "message": "File processing has been queued in the background."}
+    except HTTPException:
+        raise
     except Exception as e:
-        # If API submission fails, try to cleanup temp file immediately
-        if 'temp_file_path' in locals() and os.path.exists(temp_file_path):
+        if temp_file_path and os.path.exists(temp_file_path):
             os.remove(temp_file_path)
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -155,13 +217,10 @@ class ScrapeRequest(BaseModel):
 
 @app.post("/api/scrape")
 async def scrape_url(req: ScrapeRequest, db: Session = Depends(get_db)):
-    """
-    Accepts a URL from Next.js, scrapes it, and passes it to the local RAG processor.
-    """
+    """Accepts a URL from Next.js, scrapes it, and passes it to the local RAG processor."""
     try:
         worker.process_url_task.delay(req.url, req.friend_id)
-        
-        # Update friend config with the new data source immediately
+
         friend = db.query(models.Friend).filter(models.Friend.id == req.friend_id).first()
         if friend:
             ds = friend.dataSources[:] if friend.dataSources else []
@@ -169,14 +228,21 @@ async def scrape_url(req: ScrapeRequest, db: Session = Depends(get_db)):
                 ds.append(req.url)
                 friend.dataSources = ds
                 db.commit()
-                
+
+        logger.info(f"[SCRAPE] Queued URL '{req.url}' for friend '{req.friend_id}'")
         return {"status": "queued", "url": req.url, "message": "URL scraping has been queued in the background."}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+# P1: Paginated chat history
 @app.get("/api/chat/{friend_id}")
-def get_chat_history(friend_id: str, db: Session = Depends(get_db)):
-    messages = db.query(models.ChatMessage).filter(models.ChatMessage.friend_id == friend_id).order_by(models.ChatMessage.timestamp.asc()).all()
+def get_chat_history(friend_id: str, limit: int = 100, offset: int = 0, db: Session = Depends(get_db)):
+    messages = (
+        db.query(models.ChatMessage)
+        .filter(models.ChatMessage.friend_id == friend_id)
+        .order_by(models.ChatMessage.timestamp.asc())
+        .offset(offset).limit(limit).all()
+    )
     return [{"role": m.role, "text": m.text} for m in messages]
 
 @app.delete("/api/chat/{friend_id}")
@@ -188,46 +254,62 @@ def clear_chat_history(friend_id: str, db: Session = Depends(get_db)):
 
 @app.post("/api/chat")
 async def generate_chat(request: ChatRequest, db: Session = Depends(get_db)):
-    """
-    Simulates fetching internal documents and then sending them to the Local Llama 3 Model.
-    """
-    # 1. Retrieve the most relevant semantic chunks from the local Vector DB
-    mock_internal_knowledge = rag.query_friend_knowledge(
-        friend_id=request.friend_id, 
+    """Fetches internal documents then queries the local Llama 3 model via Ollama."""
+
+    # P0: Sanitize input against prompt injection
+    sanitize_user_input(request.prompt)
+
+    # 1. Retrieve relevant chunks from ChromaDB
+    raw_context = rag.query_friend_knowledge(
+        friend_id=request.friend_id,
         queryText=request.prompt,
         n_results=4
     )
 
-    # 2. Build the final prompt for Llama 3 with strict quality guardrails
-    has_context = "No internal" not in mock_internal_knowledge
+    # 2. Build context block
+    has_context = "No internal" not in raw_context and "No relevant" not in raw_context
+    clean_context = raw_context.replace("[INTERNAL KNOWLEDGE CHUNK]: ", "").strip()
 
-    # Fix #1: Strip [INTERNAL KNOWLEDGE CHUNK] labels so they never appear in output.
-    # The model was echoing these tags verbatim — we clean them before injecting.
-    clean_context = mock_internal_knowledge.replace("[INTERNAL KNOWLEDGE CHUNK]: ", "").strip()
-
+    # Suppress RAG context if user provides all facts inline (prevents context bleed)
+    suppress_context = is_prompt_self_contained(request.prompt)
     context_block = f"""
-BACKGROUND REFERENCE (internal company documents — use ONLY if the user explicitly asks about them):
+BACKGROUND REFERENCE (use ONLY if the user's request does not contain the needed facts):
 ---
 {clean_context}
 ---
-""" if has_context else ""
+""" if (has_context and not suppress_context) else ""
 
-    import datetime
-    today_str = datetime.date.today().strftime("%d %B %Y")  # e.g. "12 March 2026"
+    today_str = datetime.date.today().strftime("%d %B %Y")
 
     final_prompt = f"""{request.system_prompt}
 
 Today's date is {today_str}.
 
-STRICT OUTPUT RULES — follow every rule exactly, no exceptions:
-1. ONLY use facts that appear in the user's request or the background documents. Do NOT invent dates, names, metrics, features, or roadmap items that are not present in the input.
-2. ABSOLUTELY NO bracket placeholders of any kind. This includes [Your Name], [Insert Date], [Today, X], [name needed], [text], (Note: ...) or any similar pattern. If a value is missing, write the actual value or ask the user one short clarifying question. TODAY'S DATE is already provided above — use it directly, never wrap it in brackets.
-3. If the user specifies a word or sentence limit (e.g. "under 80 words", "exactly 3 sentences"), count carefully. Output ONLY within that limit. Do NOT add preamble like "Here is a summary in 3 sentences:" — just output the content.
-4. Do NOT use corporate filler phrases: "We're excited to announce", "game-changer", "This is a testament to", "Thank you for your hard work", "I'm pleased to inform", or similar hype language — unless the user explicitly requests it.
-5. If the user gives you a specific format or template, output ONLY that format. No preamble, no "Here is the response:", no closing commentary, no (Note: ...) annotations at the end.
-6. Maintain consistent tone throughout. If the prompt says "high performer", every sentence must reflect a positive evaluation — never soften to "mixed" or add weaknesses. If the prompt says "critical review", be critical throughout.
-7. Do NOT add [Meta: ...] annotations, tone labels, or audience notes to the output. These are internal instructions, not output content.
-8. The background documents are reference material only. Do NOT inject facts from those documents (names, dates, metrics, project details) into a response unless the user's request is explicitly about those documents. If the user gives you all the facts they need in the prompt itself, use only those facts.
+STRICT OUTPUT RULES — ranked by priority, follow every rule exactly:
+
+RULE 1 — CONTEXT ISOLATION (HIGHEST PRIORITY — HARD STOP):
+If the user has provided facts, data, text, bullets, or numbers directly in their request, those are the ONLY facts you may use. Completely discard background reference documents. Do NOT blend user-provided data with document data.
+
+RULE 2 — NO INVENTED CONTENT:
+Do NOT invent dates, names, metrics, future plans, events, or any detail not present in the user's request. If something is not stated, do not include it.
+
+RULE 3 — NO BRACKET PLACEHOLDERS:
+NO bracket placeholders ever: [Your Name], [Insert Date], [Today, X], [name], [text]. If a value is missing, ask one clarifying question. TODAY'S DATE = {today_str} — use it directly without wrapping in brackets.
+
+RULE 4 — RESPECT LIMITS EXACTLY:
+Respect word/sentence counts precisely ("under 80 words", "exactly 3 sentences"). Output the content only — no preamble like "Here is a summary:", no annotations like "(Note: ...)", no meta-commentary.
+
+RULE 5 — FORMAT ONLY:
+Follow the exact format or template requested. No preamble, no "Here is the response:", no explanations, no closing "(Note: I've followed the rules)".
+
+RULE 6 — CONSISTENT TONE:
+"high performer" → every sentence positive, no weaknesses. "critical review" → every sentence critical. Never mix tones or inject sentiment not requested.
+
+RULE 7 — NO META ANNOTATIONS:
+Do NOT output [Meta: ...], audience labels, tone labels, word count notes, or rule-compliance statements. These must never appear in output.
+
+RULE 8 — NO FILLER LANGUAGE:
+Banned phrases: "We're excited to announce", "game-changer", "I'm pleased to inform", "Thank you for your hard work and dedication", "testament to". Use direct language unless explicitly asked otherwise.
 {context_block}
 USER REQUEST:
 {request.prompt}
@@ -235,33 +317,37 @@ USER REQUEST:
 RESPONSE:"""
 
     try:
-        # 3. Call local Ollama runtime
+        # P0: Timeout added — prevents UI hanging on slow model responses
         response = requests.post(OLLAMA_API_URL, json={
             "model": "llama3",
             "prompt": final_prompt,
             "stream": False,
             "options": {
-                "temperature": 0.1,      # Low = more consistent/deterministic outputs
-                "top_p": 0.9,            # Prevents wildly different word choices
-                "num_predict": 2048,     # Max tokens (~1500 words) - prevents runaway outputs
-                "repeat_penalty": 1.1    # Discourages repeated generic filler phrases
+                "temperature": 0.1,
+                "top_p": 0.9,
+                "num_predict": 2048,
+                "repeat_penalty": 1.1
             }
-        })
+        }, timeout=OLLAMA_TIMEOUT_SECONDS)
         response.raise_for_status()
-        
+
         result = response.json()
-        ai_response = result.get("response", "")
-        
-        # 4. Save to chat history DB
-        user_msg = models.ChatMessage(friend_id=request.friend_id, role="user", text=request.prompt)
-        assistant_msg = models.ChatMessage(friend_id=request.friend_id, role="assistant", text=ai_response)
-        db.add(user_msg)
-        db.add(assistant_msg)
+        raw_response = result.get("response", "")
+
+        # P0: Strip preamble and annotation noise from model output
+        ai_response = clean_ai_response(raw_response)
+
+        # Save to chat history
+        db.add(models.ChatMessage(friend_id=request.friend_id, role="user", text=request.prompt))
+        db.add(models.ChatMessage(friend_id=request.friend_id, role="assistant", text=ai_response))
         db.commit()
-        
+
+        logger.info(f"[CHAT] friend='{request.friend_id}' | tokens≈{len(ai_response.split())} | context_suppressed={suppress_context}")
         return {"response": ai_response}
-        
+
+    except requests.exceptions.Timeout:
+        raise HTTPException(status_code=504, detail="The AI model took too long to respond. Try a shorter or simpler prompt.")
     except requests.exceptions.ConnectionError:
-        raise HTTPException(status_code=503, detail="Ollama local runtime is not reachable. Is the service running?")
+        raise HTTPException(status_code=503, detail="Ollama local runtime is not reachable. Is it running?")
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))

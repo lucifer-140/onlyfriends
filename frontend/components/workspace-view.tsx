@@ -187,14 +187,37 @@ export function WorkspaceView({ initialFriendId }: WorkspaceViewProps) {
     setInputValue("")
     setIsProcessing(true)
 
+    // P2: AbortController — cancel the request after 90s to prevent infinite spinner
+    const controller = new AbortController()
+    const timeoutId = setTimeout(() => controller.abort(), 90000)
+
     try {
       const res = await fetch("http://localhost:8000/api/chat", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ friend_id: selectedFriend.id, prompt: userMsg })
+        body: JSON.stringify({
+          friend_id: selectedFriend.id,
+          prompt: userMsg,
+          system_prompt: selectedFriend.system_prompt || "",
+        }),
+        signal: controller.signal,
       })
+      clearTimeout(timeoutId)
 
-      if (!res.ok) throw new Error("API error")
+      // P2: Granular error handling per status code
+      if (!res.ok) {
+        const errorData = await res.json().catch(() => ({}))
+        const detail = errorData.detail || "Unknown error"
+        let errorMsg = `**Error ${res.status}:** ${detail}`
+        if (res.status === 400) errorMsg = `**⚠️ Restricted input detected.** ${detail}`
+        if (res.status === 404) {
+          errorMsg = `**This Digital Friend no longer exists.** Please select another from the sidebar.`
+          setSelectedFriend(null)
+        }
+        if (res.status === 503) errorMsg = `**🔴 Ollama is not running.** Start Ollama and try again.`
+        if (res.status === 504) errorMsg = `**⏱ Request timed out.** The AI took too long — try a shorter prompt.`
+        throw new Error(errorMsg)
+      }
 
       const data = await res.json()
       setMessages(prev => [...prev, {
@@ -202,11 +225,15 @@ export function WorkspaceView({ initialFriendId }: WorkspaceViewProps) {
         content: data.response,
         timestamp: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
       }])
-    } catch (e) {
-      console.error(e)
+    } catch (e: any) {
+      clearTimeout(timeoutId)
+      const isAbort = e?.name === "AbortError"
+      const errorContent = isAbort
+        ? "**⏱ Request timed out (90s).** The AI is taking too long — try a shorter prompt."
+        : (e?.message?.startsWith("**") ? e.message : `**Error:** Could not connect to Ollama. Check that the backend and Ollama are running.`)
       setMessages(prev => [...prev, {
-        role: "assistant", // Using assistant for error so it shows up in the chat window safely
-        content: "**Error:** Could not connect to the local Llama 3 instance. Please ensure Ollama and the FastAPI backend are running.",
+        role: "assistant",
+        content: errorContent,
         timestamp: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
       }])
     } finally {
@@ -328,7 +355,7 @@ export function WorkspaceView({ initialFriendId }: WorkspaceViewProps) {
                   message.role === "user" ? "text-primary-foreground" : "text-foreground"
                 )}>
                   {message.role === "assistant" ? (
-                    <div className="prose prose-sm dark:prose-invert max-w-none">
+                    <div className="prose prose-sm dark:prose-invert max-w-none max-h-[500px] overflow-y-auto">
                       <ReactMarkdown>{message.content}</ReactMarkdown>
                     </div>
                   ) : (
