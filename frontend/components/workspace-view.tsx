@@ -2,6 +2,7 @@
 
 import { useState, useEffect } from "react"
 import ReactMarkdown from "react-markdown"
+import remarkGfm from "remark-gfm"
 import {
   FileText,
   Globe,
@@ -355,11 +356,31 @@ export function WorkspaceView({ initialFriendId }: WorkspaceViewProps) {
                   message.role === "user" ? "text-primary-foreground" : "text-foreground"
                 )}>
                   {message.role === "assistant" ? (
-                    <div className="prose prose-sm dark:prose-invert max-w-none max-h-[500px] overflow-y-auto">
-                      <ReactMarkdown>{message.content}</ReactMarkdown>
+                    <div className="max-h-[500px] overflow-y-auto space-y-1">
+                      <ReactMarkdown
+                        remarkPlugins={[remarkGfm]}
+                        components={{
+                          p: ({ children }) => <p className="mb-2 last:mb-0 leading-relaxed">{children}</p>,
+                          ul: ({ children }) => <ul className="mb-2 ml-4 list-disc space-y-1">{children}</ul>,
+                          ol: ({ children }) => <ol className="mb-2 ml-4 list-decimal space-y-1">{children}</ol>,
+                          li: ({ children }) => <li className="leading-relaxed">{children}</li>,
+                          strong: ({ children }) => <strong className="font-semibold">{children}</strong>,
+                          h1: ({ children }) => <h1 className="text-base font-bold mb-2 mt-1">{children}</h1>,
+                          h2: ({ children }) => <h2 className="text-sm font-bold mb-2 mt-1">{children}</h2>,
+                          h3: ({ children }) => <h3 className="text-sm font-semibold mb-1 mt-1">{children}</h3>,
+                          code: ({ children }) => <code className="bg-muted rounded px-1 py-0.5 text-xs font-mono">{children}</code>,
+                          table: ({ children }) => <table className="w-full text-xs border-collapse mb-2">{children}</table>,
+                          th: ({ children }) => <th className="border border-border bg-muted px-2 py-1 text-left font-semibold">{children}</th>,
+                          td: ({ children }) => <td className="border border-border px-2 py-1">{children}</td>,
+                          blockquote: ({ children }) => <blockquote className="border-l-2 border-primary pl-3 italic text-muted-foreground mb-2">{children}</blockquote>,
+                          hr: () => <hr className="my-2 border-border" />,
+                        }}
+                      >
+                        {message.content}
+                      </ReactMarkdown>
                     </div>
                   ) : (
-                    message.content
+                    <span className="whitespace-pre-wrap">{message.content}</span>
                   )}
                 </div>
                 <div className={cn(

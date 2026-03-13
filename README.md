@@ -24,48 +24,30 @@ The architecture consists of a robust Next.js frontend connected to a FastAPI ba
 
 ## Setup Instructions
 
-### 1. Prerequisites
-- **Node.js** (v18+)
-- **Python** (3.10+)
-- **PostgreSQL** (Running locally on `127.0.0.1:5432`, configure database `onlyfriends`, user `admin`/`admin`)
-- **Ollama** installed on your host machine.
+To run the full OnlyFriends platform, follow these steps in separate terminals:
 
-### 2. Configure Local AI
-Make sure the Ollama service is running. Pull the required models:
-```bash
-ollama pull llama3
-ollama pull nomic-embed-text
-```
+| Step | Terminal / Component | Command | Expected Output |
+| :--- | :--- | :--- | :--- |
+| 1 | **Database** | `docker start onlyfriends-pg` | `onlyfriends-pg` (container name) |
+| 2 | **Redis** | `docker start onlyfriends-redis` | `onlyfriends-redis` (container name) |
+| 3 | **FastAPI** | `cd backend` <br> `.\venv\Scripts\Activate.ps1` <br> `uvicorn main:app --reload --port 8000` | `Application startup complete.` |
+| 4 | **Celery Worker** | `cd backend` <br> `.\venv\Scripts\Activate.ps1` <br> `celery -A worker.celery_app worker --loglevel=info --pool=solo` | `Connected to redis://localhost:16379/0` |
+| 5 | **Frontend** | `cd frontend` <br> `npm run dev` | `Ready in ...ms` |
 
-### 3. Backend Setup
-Navigate into the `backend` directory, install requirements, and run the server.
+The application will then be available at `http://localhost:3000`.
 
-```bash
-cd backend
-python -m venv env
-source env/Scripts/activate # or `env/bin/activate` on mac/linux
-pip install -r requirements.txt
-uvicorn main:app --reload --port 8000
-```
+## Features Stack
+- **AI Model**: Ollama (Llama 3 base model, `nomic-embed-text` for embeddings).
+- **Backend**: Python (FastAPI + SQLAlchemy).
+- **Frontend**: Next.js (React Router) + Shadcn UI + Tailwind CSS.
+- **Async Processing**: Celery + Redis.
+- **Relational DB**: PostgreSQL.
+- **Vector DB**: ChromaDB.
 
-### 4. Database Seeding (Optional)
-To populate the database with mock ACME Corp data, an ACME seed script is included:
-```bash
-python seed.py
-```
-
-### 5. Frontend Setup
-In a separate terminal, navigate into the `frontend` directory, install packages, and start the development server.
-
-```bash
-cd frontend
-npm install
-npm run dev
-```
-
-The application will be available at `http://localhost:3000`.
-
-## Next Steps / Roadmap
-- [ ] Incorporate Web Scraping / URL Ingestion for live data source attachment.
-- [ ] Implement Celery + Redis background processing to unblock the API during massive document embedding tasks.
-- [ ] Integrate user authentication systems (Auth.js or Clerk).
+## Roadmap & Progress
+- [x] **Web Scraping / URL Ingestion**: Ingest live data sources directly via URL.
+- [x] **Background Processing**: Integrated Celery + Redis for deterministic, non-blocking RAG.
+- [x] **Dynamic Sidebar**: Live "Attached Files" and data sources management in Workspace.
+- [x] **Quality Guardrails**: Stripped preambles, anti-hallucination rules, and context isolation.
+- [ ] **Auth Integration**: Enterprise-grade user authentication.
+- [ ] **Multi-Agent Orchestration**: Specialized agents for collaborative tasks.

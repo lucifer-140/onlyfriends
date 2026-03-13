@@ -60,13 +60,21 @@ def sanitize_user_input(text: str) -> str:
 # ── P0: Post-process response cleaner ────────────────────────────────────────
 def clean_ai_response(text: str) -> str:
     """Strip preamble lines and trailing annotation notes from model output."""
-    # Remove preamble openings
+    # Remove preamble openings — all observed variants
     preamble_patterns = [
-        r"^here is (the|a|my) (response|summary|rewrite|answer|email|memo|review|table|output|text)[:\.]?\s*\n?",
-        r"^here are (three|3|the|some|your) (draft |options? |subject |lines?|bullets?|items?|points?)[:\.]?\s*\n?",
+        # "Here is the X" variants
+        r"^here is (the |a |my )?(rewritten |updated |revised |drafted |completed )?(response|summary|rewrite|answer|email|memo|review|table|output|text|result|translation)[:\.]?\s*\n?",
+        # "Here are X" variants
+        r"^here are (the |three |3 |some |your )?(draft |rewritten |updated |revised )?(options?|subject lines?|bullets?|items?|points?|results?|metrics?|action items?)[:\.]?\s*\n?",
+        # Dangling fragment endings from stripped preamble (e.g. "points based on the user's request:")
+        r"^[a-z ]+based on (the |your |user.s )?(request|prompt|input|text|provided (data|information))[:\.]?\s*\n?",
+        r"^[a-z ]+(each with a maximum of \d+ characters)[:\.]?\s*\n?",
+        r"^(subject line options?|option \d|bullet points?|action items?)[,:]?\s*\n?",
+        # Generic starters
         r"^based on (the|your) (provided |above |given )?",
         r"^sure[,!]?\s*(here is|here are|I'll|let me)?[:\.]?\s*\n?",
         r"^(I've|I have) (prepared|written|drafted|created|crafted)[^.]*\.\s*\n?",
+        r"^(as requested|as per your request|per your request)[,:]?\s*\n?",
     ]
     for pattern in preamble_patterns:
         text = re.sub(pattern, "", text, flags=re.IGNORECASE)
@@ -75,7 +83,8 @@ def clean_ai_response(text: str) -> str:
     text = re.sub(r"\n?\(Note:.*?\)\s*$", "", text, flags=re.IGNORECASE | re.DOTALL)
     text = re.sub(r"\n?Note:.*?$", "", text, flags=re.IGNORECASE)
     text = re.sub(r"\n?\[Meta:.*?\]\s*$", "", text, flags=re.IGNORECASE | re.DOTALL)
-    text = re.sub(r"\n?\(I've? (followed|stayed|used|kept).*?\)\s*$", "", text, flags=re.IGNORECASE | re.DOTALL)
+    text = re.sub(r"\n?\(I'?ve? (followed|stayed|used|kept).*?\)\s*$", "", text, flags=re.IGNORECASE | re.DOTALL)
+    text = re.sub(r"\n?\(This response is.*?\)\s*$", "", text, flags=re.IGNORECASE | re.DOTALL)
 
     return text.strip()
 
@@ -90,15 +99,35 @@ SELF_CONTAINED_SIGNALS = [
 ]
 
 def is_prompt_self_contained(prompt: str) -> bool:
-    """Returns True when the user provides all needed facts inline."""
+    """Returns True when the user provides all needed facts inline,
+    OR when the prompt is a short open-ended creative task that should NOT
+    pull from the RAG database (avoids context bleed from stored PDFs)."""
     prompt_lower = prompt.lower()
+
+    # Explicit self-containment signals
     if any(sig in prompt_lower for sig in SELF_CONTAINED_SIGNALS):
         return True
-    # Also suppress if prompt has inline structured data AND is short
+
+    # Short prompts with inline structured data (bullets, numbers, percentages)
     has_inline_data = bool(re.search(r"(\d+%|\d+\.\d+|>\s*\d|•|-\s+\w)", prompt))
     if has_inline_data and len(prompt) < 800:
         return True
+
+    # Short open-ended creative prompts (< 200 chars) that don't explicitly
+    # reference a stored document — suppress RAG so the model doesn't substitute
+    # PDF content for the user's requested topic.
+    # e.g. "Email about Phoenix project. Under 80 words." → no RAG
+    # e.g. "Based on our HR handbook, summarize..." → allow RAG
+    DOCUMENT_REFERENCE_SIGNALS = [
+        "based on", "from the", "from our", "in the document",
+        "according to", "refer to", "the attached", "the file",
+        "the policy", "the guide", "the handbook", "our documents",
+    ]
+    if len(prompt) < 200 and not any(sig in prompt_lower for sig in DOCUMENT_REFERENCE_SIGNALS):
+        return True
+
     return False
+
 
 
 class ChatRequest(BaseModel):
