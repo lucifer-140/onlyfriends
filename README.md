@@ -45,7 +45,7 @@ The application will then be available at `http://localhost:3000`.
 - **Vector DB**: ChromaDB.
 
 ## Roadmap & Progress
-- [x] **Web Scraping / URL Ingestion**: Ingest live data sources directly via URL.
+- [ ] **Web Scraping / URL Ingestion**: Ingest live data sources directly via URL.
 - [x] **Background Processing**: Integrated Celery + Redis for deterministic, non-blocking RAG.
 - [x] **Dynamic Sidebar**: Live "Attached Files" and data sources management in Workspace.
 - [x] **Quality Guardrails**: Stripped preambles, anti-hallucination rules, and context isolation.
